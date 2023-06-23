@@ -1,19 +1,18 @@
-extern crate byteorder;
-
 #[macro_use]
 extern crate serde_derive;
-extern crate serde_json;
-use std::io::prelude::*;
-use std::net::TcpStream;
+#[cfg(feature = "async")]
+use async_std::{net::TcpStream as AsyncTcpStream, prelude::*};
 use byteorder::{BigEndian, WriteBytesExt};
-use std::time::Duration;
 use std::str;
+use std::time::Duration;
+#[cfg(feature = "sync")]
+use std::{io::prelude::*, net::TcpStream};
 
-pub mod types;
 pub mod error;
+pub mod types;
 
-use types::*;
 use error::*;
+use types::*;
 
 pub struct SmartPlug {
     ip: &'static str,
@@ -21,62 +20,67 @@ pub struct SmartPlug {
 
 impl SmartPlug {
     pub fn new(ip: &'static str) -> SmartPlug {
-        SmartPlug { ip: ip }
+        SmartPlug { ip }
     }
 
-    // Wakes up the device
-    pub fn on(&self) -> Result<PlugInfo, Error> {
+    /// Wakes up the device
+    #[maybe_async::maybe_async]
+    pub async fn on(&self) -> Result<PlugInfo, Error> {
         let json = "{\"system\":{\"set_relay_state\":{\"state\":1}}}";
-        self.submit_to_device(json)
+        self.submit_to_device(json).await
     }
 
-    // Turns off the device
-    pub fn off(&self) -> Result<PlugInfo, Error> {
+    /// Turns off the device
+    #[maybe_async::maybe_async]
+    pub async fn off(&self) -> Result<PlugInfo, Error> {
         let json = "{\"system\":{\"set_relay_state\":{\"state\":0}}}";
-        self.submit_to_device(json)
+        self.submit_to_device(json).await
     }
 
-    // Gather system wide info such as model of the device, etc.
-    pub fn sysinfo(&self) -> Result<PlugInfo, Error> {
+    /// Gather system wide info such as model of the device, etc.
+    #[maybe_async::maybe_async]
+    pub async fn sysinfo(&self) -> Result<PlugInfo, Error> {
         let json = "{\"system\":{\"get_sysinfo\":{}}}";
-        self.submit_to_device(json)
+        self.submit_to_device(json).await
     }
 
-    // Gather system information as well as watt meter information
-    pub fn meterinfo(&self) -> Result<PlugInfo, Error> {
+    /// Gather system information as well as watt meter information
+    #[maybe_async::maybe_async]
+    pub async fn meterinfo(&self) -> Result<PlugInfo, Error> {
         let json = "{\"system\":{\"get_sysinfo\":{}}, \"emeter\":{\"get_realtime\":{},\"get_vgain_igain\":{}}}";
-        self.submit_to_device(json)
+        self.submit_to_device(json).await
     }
 
-    // Returns system information as well as daily statistics of power usage
-    pub fn dailystats(&self, month: i32, year: i32) -> Result<PlugInfo, Error> {
+    /// Returns system information as well as daily statistics of power usage
+    #[maybe_async::maybe_async]
+    pub async fn dailystats(&self, month: i32, year: i32) -> Result<PlugInfo, Error> {
         let json = format!(
             "{{\"emeter\":{{\"get_daystat\":{{\"month\":{},\"year\":{}}}}}}}",
-            month,
-            year
+            month, year
         );
-        self.submit_to_device(&json)
+        self.submit_to_device(&json).await
     }
 
-    fn submit_to_device(&self, msg: &str) -> Result<PlugInfo, Error> {
-        let msg = try!(encrypt(msg));
-        let mut resp = try!(send(self.ip, &msg));
+    #[maybe_async::maybe_async]
+    async fn submit_to_device(&self, msg: &str) -> Result<PlugInfo, Error> {
+        let msg = encrypt(msg)?;
+        let mut resp = send(self.ip, &msg).await?;
         let data = decrypt(&mut resp.split_off(4));
 
         // deserialize json
-        let resp = try!(serde_json::from_str(&data));
+        let resp = serde_json::from_str(&data)?;
 
         Ok(resp)
     }
 }
 
-// Prepare and encrypt message to send to the device
-// see: https://www.softscheck.com/en/reverse-engineering-tp-link-hs110/
+/// Prepare and encrypt message to send to the device
+/// see: https://www.softscheck.com/en/reverse-engineering-tp-link-hs110/
 fn encrypt(plain: &str) -> Result<Vec<u8>, Error> {
     let len = plain.len();
     let msgbytes = plain.as_bytes();
     let mut cipher = vec![];
-    try!(cipher.write_u32::<BigEndian>(len as u32));
+    cipher.write_u32::<BigEndian>(len as u32)?;
 
     let mut key = 0xAB;
     let mut payload: Vec<u8> = Vec::with_capacity(len);
@@ -87,14 +91,15 @@ fn encrypt(plain: &str) -> Result<Vec<u8>, Error> {
     }
 
     for i in &payload {
-        try!(cipher.write_u8(*i));
+        cipher.write_u8(*i)?;
     }
 
     Ok(cipher)
 }
 
-// Decrypt received string
-// see: https://www.softscheck.com/en/reverse-engineering-tp-link-hs110/
+/// Decrypt received string
+/// see: https://www.softscheck.com/en/reverse-engineering-tp-link-hs110/
+#[allow(clippy::needless_range_loop)]
 fn decrypt(cipher: &mut [u8]) -> String {
     let len = cipher.len();
 
@@ -110,29 +115,46 @@ fn decrypt(cipher: &mut [u8]) -> String {
     String::from_utf8_lossy(cipher).into_owned()
 }
 
-// Sends a message to the device and awaits a response synchronously
+/// Sends a message to the device and awaits a response synchronously
+#[maybe_async::sync_impl]
 fn send(ip: &str, payload: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut stream = try!(TcpStream::connect(ip));
+    let mut stream = TcpStream::connect(ip)?;
 
-    try!(stream.set_read_timeout(Some(Duration::new(5, 0))));
-    try!(stream.write_all(payload));
+    stream.set_read_timeout(Some(Duration::new(5, 0)))?;
+    stream.write_all(payload)?;
 
     let mut resp = vec![];
-    try!(stream.read_to_end(&mut resp));
+    stream.read_to_end(&mut resp)?;
+
+    Ok(resp)
+}
+
+/// Sends a message to the device and awaits a response asynchronously
+#[maybe_async::async_impl]
+async fn send(ip: &str, payload: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut stream = AsyncTcpStream::connect(ip).await?;
+
+    let mut resp = vec![];
+    async_std::io::timeout(Duration::new(5, 0), async {
+        stream.write_all(payload).await?;
+        stream.read_to_end(&mut resp).await?;
+        Ok(())
+    })
+    .await?;
 
     Ok(resp)
 }
 
 #[cfg(test)]
 mod tests {
-    use encrypt;
-    use decrypt;
+    use super::decrypt;
+    use super::encrypt;
 
     #[test]
     fn encrypt_decrypt() {
         let json = "{\"system\":{\"get_sysinfo\":{}}}";
 
-        let mut data = encrypt(json);
+        let mut data = encrypt(json).unwrap();
         let resp = decrypt(&mut data.split_off(4));
 
         assert_eq!(json, resp);
